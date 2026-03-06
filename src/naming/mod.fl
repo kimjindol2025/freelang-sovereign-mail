@@ -1,9 +1,25 @@
 /* ============================================================================
-   Challenge 15: Sovereign-Naming Module
+   Sovereign-Naming Module (Challenge 15)
+
+   6개 서브모듈:
+   - mail_address: DHT 주소 등록/조회
+   - key_indexing: 공개키 → Kademlia NodeId 변환
+   - ttl_manager: TTL 기반 갱신 + 복구 시스템
+   - collision_detector: Bloom Filter 기반 충돌 방지
+   - recovery_system: 3중 복제 장애 복구 (< 500ms)
+   - sync_engine: 글로벌 Merkle+VectorClock 동기화
 ============================================================================ */
 
 pub mod mail_address;
+pub mod key_indexing;
 pub mod ttl_manager;
+pub mod collision_detector;
+pub mod recovery_system;
+pub mod sync_engine;
 
 pub use mail_address::{MailAddress, MailRecord, MailAddressManager, DHTPeer};
+pub use key_indexing::{KeyHash, KBucket, KeyIndexer, KeyRotationManager};
 pub use ttl_manager::{TTLEntry, TTLManager, RecoverySystem};
+pub use collision_detector::{BloomFilter, CollisionDetector};
+pub use recovery_system::{ReplicatedEntry, RecoverySnapshot, AdvancedRecoverySystem};
+pub use sync_engine::{VectorClock, MerkleTree, SyncEntry, GlobalSyncEngine};

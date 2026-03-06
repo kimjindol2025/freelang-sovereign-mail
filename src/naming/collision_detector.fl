@@ -1,0 +1,269 @@
+/* ============================================================================
+   Collision Detector (Sovereign-Mail Challenge 15)
+
+   목적: 주소 충돌 탐지 및 방지
+   특징:
+   - Bloom Filter 기반 빠른 중복 검사 (O(1))
+   - SHA-256 해시 충돌 감지 (엔트로피 분석)
+   - 보조 해시 체인 (double hashing)
+   - 충돌 발생 시 자동 재해시
+   - 통계 기반 충돌률 모니터링
+
+   규칙: C15-R5 (주소 충돌 0%)
+
+   총 ~300줄
+============================================================================ */
+
+// ============================================================================
+// Bloom Filter (충돌 사전 방지)
+// ============================================================================
+
+pub struct BloomFilter {
+    pub bits: [u64; 256],        // 16,384-bit bloom filter
+    pub k: u8,                   // 해시 함수 개수 (k=7)
+    pub insertions: u64,
+    pub false_positives: u64,
+    pub collisions_detected: u64,
+}
+
+impl BloomFilter {
+    pub fn new(k: u8) -> Self {
+        BloomFilter {
+            bits: [0u64; 256],
+            k,
+            insertions: 0,
+            false_positives: 0,
+            collisions_detected: 0,
+        }
+    }
+
+    // ================================================================
+    // 해시 함수 (k개 독립적 해시)
+    // ================================================================
+
+    fn hash_k(&self, key: &[u8; 32], seed: u8) -> usize {
+        // FNV-1a 변형 (seed에 따라 다른 해시)
+        let mut hash = 0x811c9dc5u32.wrapping_add(seed as u32);
+        for byte in key {
+            hash ^= *byte as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        (hash as usize) % (256 * 64)  // 비트 인덱스
+    }
+
+    // ================================================================
+    // Bloom Filter 삽입
+    // ================================================================
+
+    pub fn insert(&mut self, key: &[u8; 32]) {
+        for i in 0..self.k {
+            let bit_idx = self.hash_k(key, i);
+            let word_idx = bit_idx / 64;
+            let bit_pos = bit_idx % 64;
+            self.bits[word_idx] |= 1u64 << bit_pos;
+        }
+        self.insertions += 1;
+    }
+
+    // ================================================================
+    // Bloom Filter 조회 (false positive 가능)
+    // ================================================================
+
+    pub fn might_contain(&self, key: &[u8; 32]) -> bool {
+        for i in 0..self.k {
+            let bit_idx = self.hash_k(key, i);
+            let word_idx = bit_idx / 64;
+            let bit_pos = bit_idx % 64;
+            if self.bits[word_idx] & (1u64 << bit_pos) == 0 {
+                return false;  // 확실하게 없음
+            }
+        }
+        true  // 있을 수도 있음 (false positive 가능)
+    }
+
+    // ================================================================
+    // 실제 충돌 확인 (Bloom Filter 통과 후 정확한 검사)
+    // ================================================================
+
+    pub fn check_and_insert(&mut self, key: &[u8; 32], actual_keys: &[[u8; 32]]) -> bool {
+        let maybe_exists = self.might_contain(key);
+
+        if maybe_exists {
+            // 실제 충돌인지 확인
+            for actual in actual_keys {
+                if actual == key {
+                    self.collisions_detected += 1;
+                    return true;  // 실제 충돌
+                }
+            }
+            // False positive
+            self.false_positives += 1;
+        }
+
+        // 새 키 삽입
+        self.insert(key);
+        false  // 충돌 없음
+    }
+
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.insertions, self.false_positives, self.collisions_detected)
+    }
+}
+
+// ============================================================================
+// 충돌 탐지기 (Collision Detector)
+// ============================================================================
+
+pub struct CollisionDetector {
+    pub bloom: BloomFilter,
+    pub registered_hashes: [[u8; 32]; 4096],
+    pub registered_count: u32,
+    pub double_hash_table: [Option<[u8; 32]>; 4096],  // 보조 해시 테이블
+    pub collisions: u64,
+    pub rehash_count: u64,
+}
+
+impl CollisionDetector {
+    pub fn new() -> Self {
+        CollisionDetector {
+            bloom: BloomFilter::new(7),
+            registered_hashes: [[0u8; 32]; 4096],
+            registered_count: 0,
+            double_hash_table: [None; 4096],
+            collisions: 0,
+            rehash_count: 0,
+        }
+    }
+
+    // ================================================================
+    // 보조 해시 함수 (double hashing)
+    // ================================================================
+
+    fn secondary_hash(&self, key: &[u8; 32]) -> [u8; 32] {
+        let mut h2 = [0u8; 32];
+        // SHA-256의 다른 초기값 시뮬레이션
+        let mut state = [
+            0x5be0cd19u32, 0x1f83d9ab, 0x9b05688c, 0x510e527f,
+            0xa54ff53a, 0x3c6ef372, 0xbb67ae85, 0x6a09e667,
+        ];
+
+        for i in 0..8 {
+            let w = u32::from_be_bytes([key[i*4], key[i*4+1], key[i*4+2], key[i*4+3]]);
+            state[i] ^= w;
+            state[i] = state[i].rotate_right(17) ^ state[(i+1)%8];
+        }
+
+        for i in 0..8 {
+            let bytes = state[i].to_be_bytes();
+            h2[i*4] = bytes[0];
+            h2[i*4+1] = bytes[1];
+            h2[i*4+2] = bytes[2];
+            h2[i*4+3] = bytes[3];
+        }
+        h2
+    }
+
+    // ================================================================
+    // 엔트로피 검사 (해시 품질 검증)
+    // ================================================================
+
+    pub fn check_entropy(&self, hash: &[u8; 32]) -> f32 {
+        // 바이트 분포의 엔트로피 (Shannon)
+        let mut freq = [0u32; 256];
+        for byte in hash {
+            freq[*byte as usize] += 1;
+        }
+
+        let mut entropy = 0.0f32;
+        let total = 32.0f32;
+        for count in freq.iter() {
+            if *count > 0 {
+                let p = *count as f32 / total;
+                entropy -= p * (p.log2());
+            }
+        }
+        entropy
+    }
+
+    // ================================================================
+    // 재해시 (충돌 발생 시)
+    // ================================================================
+
+    pub fn rehash(&mut self, original_hash: &[u8; 32]) -> [u8; 32] {
+        self.rehash_count += 1;
+        let mut rehashed = self.secondary_hash(original_hash);
+
+        // nonce 추가로 고유성 보장
+        let nonce = self.rehash_count as u8;
+        rehashed[31] ^= nonce;
+        rehashed[30] ^= nonce.wrapping_mul(2);
+
+        rehashed
+    }
+
+    // ================================================================
+    // 해시 등록 + 충돌 검사
+    // ================================================================
+
+    pub fn register_hash(&mut self, hash: &[u8; 32]) -> ([u8; 32], bool) {
+        // Bloom filter로 빠른 사전 검사
+        let maybe_collision = self.bloom.might_contain(hash);
+
+        if maybe_collision {
+            // 실제 충돌인지 정밀 검사
+            for i in 0..self.registered_count as usize {
+                if &self.registered_hashes[i] == hash {
+                    self.collisions += 1;
+                    // 충돌 시 재해시
+                    let new_hash = self.rehash(hash);
+                    return (new_hash, false);  // 충돌 발생, 재해시 반환
+                }
+            }
+        }
+
+        // 충돌 없음: 등록
+        if self.registered_count < 4096 {
+            let idx = self.registered_count as usize;
+            self.registered_hashes[idx] = *hash;
+            self.registered_count += 1;
+        }
+
+        self.bloom.insert(hash);
+
+        // 보조 해시 테이블에도 저장
+        let secondary = self.secondary_hash(hash);
+        let sec_idx = (secondary[0] as usize * 16 + secondary[1] as usize) % 4096;
+        self.double_hash_table[sec_idx] = Some(*hash);
+
+        (*hash, true)  // 충돌 없음, 원본 해시 반환
+    }
+
+    // ================================================================
+    // 규칙 검증
+    // ================================================================
+
+    pub fn verify_c15_r5(&self) -> bool {
+        // C15-R5: 주소 충돌 0%
+        self.collisions == 0
+    }
+
+    pub fn collision_rate(&self) -> f32 {
+        if self.registered_count == 0 {
+            return 0.0;
+        }
+        self.collisions as f32 / self.registered_count as f32
+    }
+
+    pub fn stats(&self) -> (u32, u64, u64) {
+        (self.registered_count, self.collisions, self.rehash_count)
+    }
+}
+
+static mut COLLISION_TIME: u64 = 3_000_000_000;
+
+pub fn get_collision_time() -> u64 {
+    unsafe {
+        COLLISION_TIME = COLLISION_TIME.wrapping_add(1);
+        COLLISION_TIME
+    }
+}

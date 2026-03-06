@@ -1,0 +1,317 @@
+/* ============================================================================
+   Feature Extractor (Sovereign-Mail Challenge 16)
+
+   목적: 메일에서 8가지 특성 추출 (스팸 탐지용)
+   특성:
+   1. sender_reputation: 발신자 도메인 신뢰도 (0.0 ~ 1.0)
+   2. content_entropy: 내용 엔트로피 (정보량, 스팸은 낮음)
+   3. link_density: 링크/단어 비율 (스팸은 높음)
+   4. attachment_risk: 첨부파일 위험도
+   5. suspicious_pattern: 의심 패턴 (urgent/verify/bitcoin)
+   6. capitalization_ratio: 대문자 비율 (스팸은 높음)
+   7. sending_time_score: 발송 시간 점수 (야간/새벽 = 낮음)
+   8. header_anomaly: 헤더 이상 점수 (리레이/위조)
+
+   규칙: C16-R1 (정확도 99.9%), C16-R3 (FP < 0.01%)
+
+   ~400줄
+============================================================================ */
+
+// ============================================================================
+// 특성 추출기 설정
+// ============================================================================
+
+pub struct FeatureConfig {
+    pub suspicious_keywords: [[u8; 16]; 12],
+    pub keyword_count: u8,
+    pub trusted_domains: [[u8; 32]; 8],
+    pub trusted_count: u8,
+}
+
+impl FeatureConfig {
+    pub fn new() -> Self {
+        // 의심 키워드 (12개)
+        let mut keywords: [[u8; 16]; 12] = [[0u8; 16]; 12];
+        let words = [
+            b"verify\0\0\0\0\0\0\0\0\0\0",
+            b"urgent\0\0\0\0\0\0\0\0\0\0",
+            b"confirm\0\0\0\0\0\0\0\0\0",
+            b"account\0\0\0\0\0\0\0\0\0",
+            b"password\0\0\0\0\0\0\0\0",
+            b"bitcoin\0\0\0\0\0\0\0\0\0",
+            b"lottery\0\0\0\0\0\0\0\0\0",
+            b"winner\0\0\0\0\0\0\0\0\0\0",
+            b"million\0\0\0\0\0\0\0\0\0",
+            b"click\0\0\0\0\0\0\0\0\0\0\0",
+            b"free\0\0\0\0\0\0\0\0\0\0\0\0",
+            b"limited\0\0\0\0\0\0\0\0\0",
+        ];
+
+        for (i, word) in words.iter().enumerate() {
+            keywords[i] = **word;
+        }
+
+        // 신뢰할 수 있는 도메인 (8개)
+        let mut trusted: [[u8; 32]; 8] = [[0u8; 32]; 8];
+        let domains: [&[u8; 32]; 4] = [
+            b"sovereign.mail\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            b"dclub.kr\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            b"protonmail.com\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            b"tutanota.com\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        ];
+        for (i, domain) in domains.iter().enumerate() {
+            trusted[i] = **domain;
+        }
+
+        FeatureConfig {
+            suspicious_keywords: keywords,
+            keyword_count: 12,
+            trusted_domains: trusted,
+            trusted_count: 4,
+        }
+    }
+}
+
+// ============================================================================
+// 이메일 헤더 구조체
+// ============================================================================
+
+pub struct EmailHeader {
+    pub from_domain: [u8; 64],
+    pub to: [u8; 64],
+    pub subject: [u8; 256],
+    pub date_hour: u8,           // 발송 시간 (0-23)
+    pub relay_count: u8,         // 릴레이 서버 수
+    pub has_dkim: bool,
+    pub has_spf: bool,
+    pub has_dmarc: bool,
+}
+
+// ============================================================================
+// 특성 추출기 (Feature Extractor)
+// ============================================================================
+
+pub struct FeatureExtractor {
+    pub config: FeatureConfig,
+    pub extractions: u64,
+    pub spam_features: u64,     // 스팸으로 추출된 수
+    pub ham_features: u64,      // 햄으로 추출된 수
+}
+
+impl FeatureExtractor {
+    pub fn new() -> Self {
+        FeatureExtractor {
+            config: FeatureConfig::new(),
+            extractions: 0,
+            spam_features: 0,
+            ham_features: 0,
+        }
+    }
+
+    // ================================================================
+    // Feature 1: Sender Reputation (0.0 ~ 1.0)
+    // ================================================================
+
+    pub fn sender_reputation(&self, header: &EmailHeader) -> f32 {
+        let mut score = 0.5f32;
+
+        // DKIM/SPF/DMARC 점수
+        if header.has_dkim { score += 0.15; }
+        if header.has_spf { score += 0.15; }
+        if header.has_dmarc { score += 0.10; }
+
+        // 신뢰 도메인 확인
+        for i in 0..self.config.trusted_count as usize {
+            let domain = &self.config.trusted_domains[i];
+            let match_len = domain.iter()
+                .zip(header.from_domain.iter())
+                .take_while(|(a, b)| **a == **b && **a != 0)
+                .count();
+            if match_len > 4 {
+                score += 0.20;
+                break;
+            }
+        }
+
+        score.min(1.0)
+    }
+
+    // ================================================================
+    // Feature 2: Content Entropy (Shannon 엔트로피)
+    // ================================================================
+
+    pub fn content_entropy(&self, body: &[u8]) -> f32 {
+        let mut freq = [0u32; 256];
+        let total = body.len();
+
+        for byte in body {
+            freq[*byte as usize] += 1;
+        }
+
+        let mut entropy = 0.0f32;
+        if total > 0 {
+            for count in freq.iter() {
+                if *count > 0 {
+                    let p = *count as f32 / total as f32;
+                    entropy -= p * p.log2();
+                }
+            }
+        }
+
+        // 정규화 (0 ~ 8 bits → 0 ~ 1)
+        (entropy / 8.0).min(1.0)
+    }
+
+    // ================================================================
+    // Feature 3: Link Density (링크/단어 비율)
+    // ================================================================
+
+    pub fn link_density(&self, body: &[u8]) -> f32 {
+        let mut link_count = 0u32;
+        let mut word_count = 1u32;
+
+        // 링크 카운트 (http/https)
+        let len = body.len().saturating_sub(4);
+        for i in 0..len {
+            if body[i] == b'h' && body[i+1] == b't' && body[i+2] == b't' {
+                link_count += 1;
+            }
+            // 단어 카운트 (공백)
+            if body[i] == b' ' || body[i] == b'\n' {
+                word_count += 1;
+            }
+        }
+
+        ((link_count as f32) / (word_count as f32)).min(1.0)
+    }
+
+    // ================================================================
+    // Feature 4: Attachment Risk
+    // ================================================================
+
+    pub fn attachment_risk(&self, attachment_count: u8, attachment_types: u8) -> f32 {
+        // 첨부 개수 + 위험한 파일 타입 (exe/zip/bat)
+        let count_score = (attachment_count as f32 / 5.0).min(0.5);
+        let type_score = if attachment_types > 0 { 0.5 } else { 0.0 };
+        (count_score + type_score).min(1.0)
+    }
+
+    // ================================================================
+    // Feature 5: Suspicious Pattern Score
+    // ================================================================
+
+    pub fn suspicious_pattern_score(&self, subject: &[u8], body: &[u8]) -> f32 {
+        let mut matched = 0u8;
+
+        for i in 0..self.config.keyword_count as usize {
+            let keyword = &self.config.suspicious_keywords[i];
+            // 키워드 길이 계산 (null 종료 전)
+            let kw_len = keyword.iter().take_while(|&&b| b != 0).count();
+            if kw_len == 0 { continue; }
+
+            // 제목에서 검색
+            if subject.windows(kw_len).any(|w| w == &keyword[..kw_len]) {
+                matched += 1;
+            }
+            // 본문에서 검색
+            else if body.windows(kw_len).any(|w| w == &keyword[..kw_len]) {
+                matched += 1;
+            }
+        }
+
+        (matched as f32 / 12.0).min(1.0)
+    }
+
+    // ================================================================
+    // Feature 6: Capitalization Ratio
+    // ================================================================
+
+    pub fn capitalization_ratio(&self, subject: &[u8]) -> f32 {
+        let mut caps = 0u32;
+        let mut total = 0u32;
+
+        for byte in subject {
+            if *byte >= b'A' && *byte <= b'Z' { caps += 1; }
+            if *byte >= b'A' && *byte <= b'z' { total += 1; }
+        }
+
+        if total == 0 { 0.0 } else { (caps as f32 / total as f32).min(1.0) }
+    }
+
+    // ================================================================
+    // Feature 7: Sending Time Score (야간 = 높음)
+    // ================================================================
+
+    pub fn sending_time_score(&self, hour: u8) -> f32 {
+        // 0-5시: 스팸 위험 높음, 9-18시: 정상 근무시간
+        match hour {
+            0..=5 => 0.8,   // 새벽: 스팸 위험
+            6..=8 => 0.5,   // 아침: 중간
+            9..=18 => 0.1,  // 근무시간: 정상
+            19..=23 => 0.4, // 저녁: 약간 위험
+            _ => 0.5,
+        }
+    }
+
+    // ================================================================
+    // Feature 8: Header Anomaly Score
+    // ================================================================
+
+    pub fn header_anomaly_score(&self, header: &EmailHeader) -> f32 {
+        let mut anomaly = 0.0f32;
+
+        // 릴레이 수가 많으면 의심
+        if header.relay_count > 5 { anomaly += 0.4; }
+        else if header.relay_count > 2 { anomaly += 0.2; }
+
+        // DKIM/SPF/DMARC 없으면 의심
+        if !header.has_dkim { anomaly += 0.2; }
+        if !header.has_spf { anomaly += 0.2; }
+        if !header.has_dmarc { anomaly += 0.1; }
+
+        anomaly.min(1.0)
+    }
+
+    // ================================================================
+    // 전체 8가지 특성 추출
+    // ================================================================
+
+    pub fn extract_all(
+        &mut self,
+        header: &EmailHeader,
+        body: &[u8],
+        attachment_count: u8,
+        dangerous_attachment: bool,
+    ) -> [f32; 8] {
+        self.extractions += 1;
+
+        let features = [
+            self.sender_reputation(header),
+            self.content_entropy(body),
+            self.link_density(body),
+            self.attachment_risk(attachment_count, if dangerous_attachment { 1 } else { 0 }),
+            self.suspicious_pattern_score(&header.subject, body),
+            self.capitalization_ratio(&header.subject),
+            self.sending_time_score(header.date_hour),
+            self.header_anomaly_score(header),
+        ];
+
+        // 스팸/햄 분류 통계
+        let spam_score: f32 = features[2..8].iter().sum::<f32>() / 6.0;
+        if spam_score > 0.5 {
+            self.spam_features += 1;
+        } else {
+            self.ham_features += 1;
+        }
+
+        features
+    }
+
+    // ================================================================
+    // 규칙 검증
+    // ================================================================
+
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (self.extractions, self.spam_features, self.ham_features)
+    }
+}

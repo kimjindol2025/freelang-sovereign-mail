@@ -1,0 +1,315 @@
+/* ============================================================================
+   Sync Engine (Sovereign-Mail Challenge 15)
+
+   목적: 글로벌 DHT 동기화 (C15-R6)
+   특징:
+   - 멀티노드 일관성 (eventual consistency)
+   - Vector Clock 기반 버전 관리
+   - 충돌 해결 (Last-Write-Wins)
+   - 델타 동기화 (변경된 것만 전송)
+   - Merkle Tree 기반 무결성 검증
+
+   규칙: C15-R6 (동기화 정확도 ≥99%)
+
+   총 ~350줄
+============================================================================ */
+
+// ============================================================================
+// Vector Clock (버전 벡터)
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct VectorClock {
+    pub clocks: [u64; 8],        // 최대 8 노드
+    pub node_count: u8,
+}
+
+impl VectorClock {
+    pub fn new() -> Self {
+        VectorClock {
+            clocks: [0u64; 8],
+            node_count: 0,
+        }
+    }
+
+    pub fn increment(&mut self, node_id: u8) {
+        let idx = (node_id as usize) % 8;
+        self.clocks[idx] += 1;
+        if node_id as usize >= self.node_count as usize {
+            self.node_count = node_id + 1;
+        }
+    }
+
+    // 벡터 시계 병합 (동기화)
+    pub fn merge(&mut self, other: &VectorClock) {
+        for i in 0..8 {
+            if other.clocks[i] > self.clocks[i] {
+                self.clocks[i] = other.clocks[i];
+            }
+        }
+        if other.node_count > self.node_count {
+            self.node_count = other.node_count;
+        }
+    }
+
+    // 인과 관계 비교
+    pub fn happens_before(&self, other: &VectorClock) -> bool {
+        let mut at_least_one_less = false;
+        for i in 0..8 {
+            if self.clocks[i] > other.clocks[i] {
+                return false;  // self가 other 이후
+            }
+            if self.clocks[i] < other.clocks[i] {
+                at_least_one_less = true;
+            }
+        }
+        at_least_one_less
+    }
+}
+
+// ============================================================================
+// Merkle Tree (무결성 검증)
+// ============================================================================
+
+pub struct MerkleTree {
+    pub leaves: [[u8; 32]; 64],  // 최대 64 리프
+    pub leaf_count: u8,
+    pub root_hash: [u8; 32],
+}
+
+impl MerkleTree {
+    pub fn new() -> Self {
+        MerkleTree {
+            leaves: [[0u8; 32]; 64],
+            leaf_count: 0,
+            root_hash: [0u8; 32],
+        }
+    }
+
+    pub fn add_leaf(&mut self, hash: &[u8; 32]) {
+        if self.leaf_count < 64 {
+            let idx = self.leaf_count as usize;
+            self.leaves[idx] = *hash;
+            self.leaf_count += 1;
+            self.update_root();
+        }
+    }
+
+    fn hash_pair(&self, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut result = [0u8; 32];
+        for i in 0..32 {
+            result[i] = a[i] ^ b[i];
+        }
+        // 추가 회전으로 avalanche effect
+        for i in 0..31 {
+            result[i] ^= result[i + 1].rotate_left(3);
+        }
+        result
+    }
+
+    fn update_root(&mut self) {
+        if self.leaf_count == 0 {
+            return;
+        }
+
+        let mut level = self.leaves[..self.leaf_count as usize].to_vec();
+
+        // 레벨이 1이 될 때까지 쌍으로 해시
+        while level.len() > 1 {
+            let mut next_level = Vec::new();
+            let mut i = 0;
+            while i < level.len() {
+                if i + 1 < level.len() {
+                    let pair_hash = self.hash_pair(&level[i], &level[i + 1]);
+                    next_level.push(pair_hash);
+                    i += 2;
+                } else {
+                    // 홀수: 마지막 리프를 자기 자신과 쌍
+                    let pair_hash = self.hash_pair(&level[i], &level[i]);
+                    next_level.push(pair_hash);
+                    i += 1;
+                }
+            }
+            level = next_level;
+        }
+
+        if !level.is_empty() {
+            self.root_hash = level[0];
+        }
+    }
+
+    pub fn verify_integrity(&self, expected_root: &[u8; 32]) -> bool {
+        self.root_hash == *expected_root
+    }
+}
+
+// ============================================================================
+// 동기화 항목 (Sync Entry)
+// ============================================================================
+
+#[derive(Clone, Copy)]
+pub struct SyncEntry {
+    pub key: [u8; 32],
+    pub value: [u8; 64],
+    pub clock: VectorClock,
+    pub synced_to: [bool; 8],    // 동기화된 노드 마스크
+}
+
+// ============================================================================
+// 글로벌 동기화 엔진
+// ============================================================================
+
+pub struct GlobalSyncEngine {
+    pub entries: [Option<SyncEntry>; 1024],
+    pub entry_count: u32,
+    pub merkle: MerkleTree,
+    pub synced_entries: u64,
+    pub sync_failures: u64,
+    pub delta_syncs: u64,
+    pub consistency_violations: u64,
+    pub local_node_id: u8,
+}
+
+impl GlobalSyncEngine {
+    pub fn new(node_id: u8) -> Self {
+        GlobalSyncEngine {
+            entries: [None; 1024],
+            entry_count: 0,
+            merkle: MerkleTree::new(),
+            synced_entries: 0,
+            sync_failures: 0,
+            delta_syncs: 0,
+            consistency_violations: 0,
+            local_node_id: node_id,
+        }
+    }
+
+    // ================================================================
+    // 항목 저장 (로컬)
+    // ================================================================
+
+    pub fn store(&mut self, key: &[u8; 32], value: &[u8; 64]) {
+        let idx = ((key[0] as usize) * 4 + key[1] as usize) % 1024;
+
+        let mut clock = VectorClock::new();
+        clock.increment(self.local_node_id);
+
+        let entry = SyncEntry {
+            key: *key,
+            value: *value,
+            clock,
+            synced_to: [false; 8],
+        };
+
+        self.entries[idx] = Some(entry);
+        self.entry_count += 1;
+        self.merkle.add_leaf(key);
+    }
+
+    // ================================================================
+    // 델타 동기화 (변경된 항목만)
+    // ================================================================
+
+    pub fn delta_sync_to(&mut self, peer_engine: &mut GlobalSyncEngine) -> u32 {
+        let mut synced = 0;
+        let peer_id = peer_engine.local_node_id as usize;
+
+        for i in 0..1024 {
+            if let Some(mut entry) = self.entries[i] {
+                if !entry.synced_to[peer_id % 8] {
+                    // 피어에 동기화
+                    peer_engine.receive_sync(&entry.key, &entry.value, &entry.clock);
+                    entry.synced_to[peer_id % 8] = true;
+                    self.entries[i] = Some(entry);
+                    synced += 1;
+                    self.delta_syncs += 1;
+                }
+            }
+        }
+
+        self.synced_entries += synced as u64;
+        synced
+    }
+
+    // ================================================================
+    // 동기화 수신 (Last-Write-Wins)
+    // ================================================================
+
+    pub fn receive_sync(&mut self, key: &[u8; 32], value: &[u8; 64], remote_clock: &VectorClock) {
+        let idx = ((key[0] as usize) * 4 + key[1] as usize) % 1024;
+
+        if let Some(mut existing) = self.entries[idx] {
+            if existing.key == *key {
+                // 충돌 해결: Last-Write-Wins (더 높은 vector clock 우선)
+                if existing.clock.happens_before(remote_clock) {
+                    // 원격이 더 최신: 업데이트
+                    existing.value = *value;
+                    existing.clock.merge(remote_clock);
+                    self.entries[idx] = Some(existing);
+                } else if remote_clock.happens_before(&existing.clock) {
+                    // 로컬이 더 최신: 무시
+                } else {
+                    // 동시 업데이트: 일관성 위반 기록 + LWW
+                    self.consistency_violations += 1;
+                    // 최신 타임스탬프 우선 (LWW 시뮬레이션)
+                    existing.clock.merge(remote_clock);
+                    self.entries[idx] = Some(existing);
+                }
+                return;
+            }
+        }
+
+        // 새 항목 삽입
+        let mut clock = *remote_clock;
+        clock.increment(self.local_node_id);
+
+        let entry = SyncEntry {
+            key: *key,
+            value: *value,
+            clock,
+            synced_to: [false; 8],
+        };
+
+        self.entries[idx] = Some(entry);
+        self.entry_count += 1;
+        self.merkle.add_leaf(key);
+    }
+
+    // ================================================================
+    // Merkle 검증
+    // ================================================================
+
+    pub fn verify_with_peer(&self, peer_root: &[u8; 32]) -> bool {
+        self.merkle.verify_integrity(peer_root)
+    }
+
+    // ================================================================
+    // 일관성 검사
+    // ================================================================
+
+    pub fn consistency_rate(&self) -> f32 {
+        if self.synced_entries == 0 {
+            return 1.0;
+        }
+        1.0 - (self.consistency_violations as f32 / self.synced_entries as f32)
+    }
+
+    // ================================================================
+    // 규칙 검증
+    // ================================================================
+
+    pub fn verify_c15_r6(&self) -> bool {
+        // C15-R6: 동기화 정확도 ≥99%
+        self.consistency_rate() >= 0.99
+    }
+
+    pub fn stats(&self) -> (u32, u64, u64, u64, u64) {
+        (
+            self.entry_count,
+            self.synced_entries,
+            self.delta_syncs,
+            self.sync_failures,
+            self.consistency_violations,
+        )
+    }
+}

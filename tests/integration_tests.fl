@@ -2,13 +2,17 @@
    Sovereign-Mail: E2E Integration Tests (Challenge 14-16)
 
    전체 시스템 무관용 테스트
+   - Challenge 14: L0-Mail-Core (암호화 파이프라인)
+   - Challenge 15: Sovereign-Naming (DHT 주소 시스템)
+   - Challenge 16: L0NN-Mail-Sentry (AI 스팸 필터)
+   - E2E: 전체 메일 처리 파이프라인
 ============================================================================ */
 
 #[cfg(test)]
 mod integration_tests {
-    use crate::core::{AESContext, RSAContext, HMACValidator};
-    use crate::naming::MailAddressManager;
-    use crate::sentry::NeuralNetwork;
+    use crate::core::{AESContext, RSAContext, HMACValidator, KeyDerivationContext, MemoryCleaner};
+    use crate::naming::{MailAddressManager, KeyIndexer, CollisionDetector, AdvancedRecoverySystem, GlobalSyncEngine};
+    use crate::sentry::{NeuralNetwork, SpamDetector, FeatureExtractor, EmailHeader, OnlineLearner, ZeroDayGuard};
 
     #[test]
     fn test_sovereign_mail_complete_flow() {

@@ -1,9 +1,22 @@
 /* ============================================================================
-   Challenge 16: L0NN-Mail-Sentry Module
+   L0NN-Mail-Sentry Module (Challenge 16)
+
+   5개 서브모듈:
+   - neural_classifier: 3-layer 신경망 (< 10µs 추론)
+   - spam_detector: 8가지 특성 기반 스팸 분류기
+   - feature_extractor: 이메일 특성 추출 엔진
+   - online_learner: 실시간 SGD 온라인 학습
+   - zero_day_guard: 미지 스팸 N-gram + 이상치 탐지
 ============================================================================ */
 
 pub mod neural_classifier;
 pub mod spam_detector;
+pub mod feature_extractor;
+pub mod online_learner;
+pub mod zero_day_guard;
 
 pub use neural_classifier::NeuralNetwork;
 pub use spam_detector::{EmailMessage, FeatureVector, SpamDetector};
+pub use feature_extractor::{FeatureConfig, EmailHeader, FeatureExtractor};
+pub use online_learner::{TrainingSample, MiniBatchBuffer, ADWINDetector, OnlineLearner};
+pub use zero_day_guard::{NGramPattern, StatBaseline, QuarantineQueue, ZeroDayGuard};
